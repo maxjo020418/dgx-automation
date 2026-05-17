@@ -1,0 +1,36 @@
+- name: Roll back DGX LLM stack
+  hosts: dgx
+  become: true
+  vars_files:
+    - ../stack.yml
+  tasks:
+    - name: Require release variable
+      ansible.builtin.assert:
+        that:
+          - release is defined
+          - release | length > 0
+        fail_msg: "Pass -e release=<release-directory> or make rollback RELEASE=<release-directory>"
+
+    - name: Restore release files
+      ansible.builtin.shell: |
+        set -euo pipefail
+        release_dir="{{ deploy_dir }}/releases/{{ release }}"
+        test -d "$release_dir"
+        for path in compose.yml litellm.config.yaml prometheus.yml prometheus-vllm-targets.yml traefik-dynamic.yml .env; do
+          if [ -e "${release_dir}/${path}" ]; then
+            cp -a "${release_dir}/${path}" "{{ deploy_dir }}/${path}"
+          fi
+        done
+      args:
+        executable: /bin/bash
+
+    - name: Validate restored compose config
+      ansible.builtin.command:
+        cmd: docker compose -p {{ project_name }} -f compose.yml config
+        chdir: "{{ deploy_dir }}"
+      changed_when: false
+
+    - name: Apply restored stack
+      ansible.builtin.command:
+        cmd: docker compose -p {{ project_name }} -f compose.yml up -d --remove-orphans
+        chdir: "{{ deploy_dir }}"

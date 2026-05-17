@@ -1,0 +1,8 @@
+{{ header }}
+http:
+  middlewares:
+    secure-headers:
+      headers:
+        frameDeny: true
+        contentTypeNosniff: true
+        browserXssFilter: true

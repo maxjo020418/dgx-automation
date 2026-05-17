@@ -1,0 +1,8 @@
+{{ header }}
+- targets:
+{% for model in models %}
+    - {{ model.metrics_target }}
+{% endfor %}
+  labels:
+    job: vllm
+    stack: {{ stack.project_name }}

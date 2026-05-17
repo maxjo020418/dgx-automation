@@ -1,0 +1,270 @@
+- name: Apply DGX LLM stack
+  hosts: dgx
+  become: true
+  vars_files:
+    - ../stack.yml
+  vars:
+    stop_legacy: "{{ legacy.stop_on_apply | default(true) }}"
+    pull_images: true
+    compose_up: true
+    release_id: "{{ ansible_date_time.iso8601_basic_short }}"
+
+  tasks:
+    - name: Ensure deploy directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ deploy_dir }}"
+        - "{{ deploy_dir }}/releases"
+        - "{{ deploy_dir }}/chat-templates"
+        - "{{ deploy_dir }}/grafana/provisioning/datasources"
+        - "{{ deploy_dir }}/grafana/provisioning/dashboards"
+        - "{{ deploy_dir }}/grafana/dashboards"
+        - "{{ deploy_dir }}/searxng"
+        - "{{ deploy_dir }}/gpu-exporter"
+
+    - name: Install initial environment file when missing
+      ansible.builtin.copy:
+        src: ../.env.example
+        dest: "{{ deploy_dir }}/.env"
+        mode: "0600"
+        force: false
+
+    - name: Ensure runtime secrets exist
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import re
+        import secrets
+        from pathlib import Path
+
+        env_path = Path("{{ deploy_dir }}/.env")
+        legacy_hf_path = Path("{{ secrets.existing_hf_token_file }}")
+        env = {}
+        order = []
+        if env_path.exists():
+            for raw in env_path.read_text().splitlines():
+                if "=" in raw and not raw.lstrip().startswith("#"):
+                    key, value = raw.split("=", 1)
+                    env[key] = value
+                    order.append(key)
+
+        def set_default(key, value, replace_values=("", "change-me-before-use")):
+            if env.get(key, "") in replace_values:
+                env[key] = value
+                if key not in order:
+                    order.append(key)
+
+        if {{ 'True' if services.litellm.auth_enabled | default(true) | bool else 'False' }}:
+            set_default("LITELLM_MASTER_KEY", "sk-" + secrets.token_hex(32))
+        else:
+            env.pop("LITELLM_MASTER_KEY", None)
+            order = [key for key in order if key != "LITELLM_MASTER_KEY"]
+        set_default("GRAFANA_ADMIN_PASSWORD", secrets.token_urlsafe(24))
+        set_default("SEARXNG_SECRET_KEY", secrets.token_urlsafe(32))
+        if not env.get("GRAFANA_ADMIN_USER"):
+            env["GRAFANA_ADMIN_USER"] = "admin"
+            order.append("GRAFANA_ADMIN_USER")
+
+        if not env.get("HF_TOKEN") and legacy_hf_path.exists():
+            for line in legacy_hf_path.read_text().splitlines():
+                match = re.match(r"^(?:export\s+)?HF_TOKEN=(.*)$", line.strip())
+                if match:
+                    token = match.group(1).strip().strip('"').strip("'")
+                    if token:
+                        env["HF_TOKEN"] = token
+                        if "HF_TOKEN" not in order:
+                            order.append("HF_TOKEN")
+
+        seen = set()
+        lines = []
+        for key in order:
+            if key in env and key not in seen:
+                lines.append(f"{key}={env[key]}")
+                seen.add(key)
+        for key in sorted(set(env) - seen):
+            lines.append(f"{key}={env[key]}")
+        env_path.write_text("\n".join(lines) + "\n")
+        env_path.chmod(0o600)
+        PY
+      args:
+        executable: /bin/bash
+      changed_when: false
+      no_log: true
+      when: not ansible_check_mode
+
+    - name: Create release archive directory
+      ansible.builtin.file:
+        path: "{{ deploy_dir }}/releases/{{ release_id }}"
+        state: directory
+        mode: "0755"
+
+    - name: Archive previous runtime files when present
+      ansible.builtin.shell: |
+        set -euo pipefail
+        for path in compose.yml litellm.config.yaml prometheus.yml prometheus-vllm-targets.yml traefik-dynamic.yml .env; do
+          if [ -e "{{ deploy_dir }}/${path}" ]; then
+            cp -a "{{ deploy_dir }}/${path}" "{{ deploy_dir }}/releases/{{ release_id }}/${path}"
+          fi
+        done
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Copy generated compose
+      ansible.builtin.copy:
+        src: ../generated/docker-compose.generated.yml
+        dest: "{{ deploy_dir }}/compose.yml"
+        mode: "0644"
+
+    - name: Copy generated LiteLLM config
+      ansible.builtin.copy:
+        src: ../generated/litellm.config.yaml
+        dest: "{{ deploy_dir }}/litellm.config.yaml"
+        mode: "0640"
+      notify: Restart LiteLLM
+
+    - name: Copy generated Prometheus vLLM targets
+      ansible.builtin.copy:
+        src: ../generated/prometheus-vllm-targets.yml
+        dest: "{{ deploy_dir }}/prometheus-vllm-targets.yml"
+        mode: "0644"
+      notify: Restart monitoring stack
+
+    - name: Copy generated Traefik dynamic config
+      ansible.builtin.copy:
+        src: ../generated/traefik-dynamic.yml
+        dest: "{{ deploy_dir }}/traefik-dynamic.yml"
+        mode: "0644"
+      notify: Restart Traefik
+
+    - name: Copy static runtime files
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: "../files/prometheus.yml", dest: "{{ deploy_dir }}/prometheus.yml", mode: "0644" }
+        - { src: "../files/grafana/provisioning/datasources/prometheus.yml", dest: "{{ deploy_dir }}/grafana/provisioning/datasources/prometheus.yml", mode: "0644" }
+        - { src: "../files/grafana/provisioning/dashboards/dashboards.yml", dest: "{{ deploy_dir }}/grafana/provisioning/dashboards/dashboards.yml", mode: "0644" }
+        - { src: "../files/grafana/dashboards/spark-system-vllm.json", dest: "{{ deploy_dir }}/grafana/dashboards/spark-system-vllm.json", mode: "0644" }
+        - { src: "../files/searxng/settings.yml", dest: "{{ deploy_dir }}/searxng/settings.yml", mode: "0644" }
+        - { src: "../files/gpu-exporter/Dockerfile", dest: "{{ deploy_dir }}/gpu-exporter/Dockerfile", mode: "0644" }
+        - { src: "../files/gpu-exporter/gpu_exporter.py", dest: "{{ deploy_dir }}/gpu-exporter/gpu_exporter.py", mode: "0755" }
+      notify: Restart config-bound services
+
+    - name: Remove retired Grafana dashboards
+      ansible.builtin.file:
+        path: "{{ deploy_dir }}/grafana/dashboards/{{ item }}"
+        state: absent
+      loop:
+        - dgx-overview.json
+      notify: Restart config-bound services
+
+    - name: Copy chat templates
+      ansible.builtin.copy:
+        src: ../chat-templates/
+        dest: "{{ deploy_dir }}/chat-templates/"
+        mode: "0644"
+      notify: Restart vLLM services
+
+    - name: Check Docker Compose config
+      ansible.builtin.command:
+        cmd: docker compose -p {{ project_name }} -f compose.yml config
+        chdir: "{{ deploy_dir }}"
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Stop legacy containers
+      ansible.builtin.command:
+        cmd: docker rm -f {{ item }}
+      loop: "{{ legacy.containers }}"
+      register: legacy_stop
+      failed_when: false
+      changed_when: legacy_stop.rc == 0
+      when:
+        - stop_legacy | bool
+        - not ansible_check_mode
+
+    - name: Pull remote images
+      ansible.builtin.command:
+        cmd: docker compose -p {{ project_name }} -f compose.yml pull --ignore-buildable --ignore-pull-failures
+        chdir: "{{ deploy_dir }}"
+      register: pull_result
+      failed_when: false
+      changed_when: pull_result.rc == 0
+      when:
+        - pull_images | bool
+        - not ansible_check_mode
+
+    - name: Apply Compose stack
+      ansible.builtin.command:
+        cmd: docker compose -p {{ project_name }} -f compose.yml up -d --build --remove-orphans
+        chdir: "{{ deploy_dir }}"
+      when:
+        - compose_up | bool
+        - not ansible_check_mode
+
+    - name: Wait for LiteLLM HTTP surface
+      ansible.builtin.uri:
+        url: "http://{{ network.bind_ip }}:{{ services.litellm.host_port }}/v1/models"
+        method: GET
+        status_code: [200, 401, 403]
+      register: litellm_health
+      retries: 30
+      delay: 5
+      until: litellm_health.status in [200, 401, 403]
+      when:
+        - services.litellm.expose_host | bool
+        - compose_up | bool
+        - not ansible_check_mode
+
+  handlers:
+    - name: Restart LiteLLM
+      ansible.builtin.command:
+        cmd: docker compose -p {{ project_name }} -f compose.yml restart litellm
+        chdir: "{{ deploy_dir }}"
+      when:
+        - compose_up | bool
+        - not ansible_check_mode
+
+    - name: Restart Traefik
+      ansible.builtin.command:
+        cmd: docker compose -p {{ project_name }} -f compose.yml restart traefik
+        chdir: "{{ deploy_dir }}"
+      when:
+        - compose_up | bool
+        - not ansible_check_mode
+
+    - name: Restart monitoring stack
+      ansible.builtin.command:
+        cmd: docker compose -p {{ project_name }} -f compose.yml restart prometheus grafana
+        chdir: "{{ deploy_dir }}"
+      when:
+        - compose_up | bool
+        - not ansible_check_mode
+
+    - name: Restart config-bound services
+      ansible.builtin.command:
+        cmd: docker compose -p {{ project_name }} -f compose.yml restart prometheus grafana searxng gpu-exporter
+        chdir: "{{ deploy_dir }}"
+      when:
+        - compose_up | bool
+        - not ansible_check_mode
+
+    - name: Restart vLLM services
+      ansible.builtin.shell: |
+        set -euo pipefail
+        services="$(docker compose -p {{ project_name }} -f compose.yml config --services | grep '^vllm-' | tr '\n' ' ')"
+        if [ -n "$services" ]; then
+          docker compose -p {{ project_name }} -f compose.yml restart $services
+        fi
+      args:
+        executable: /bin/bash
+        chdir: "{{ deploy_dir }}"
+      when:
+        - compose_up | bool
+        - not ansible_check_mode

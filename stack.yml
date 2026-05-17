@@ -1,0 +1,108 @@
+project_name: dgxllm
+deploy_dir: /opt/dgx-llm-stack
+
+domain:
+  base: spark.cg-rookies.net
+  openwebui: chat.spark.cg-rookies.net
+  litellm: api.spark.cg-rookies.net
+  grafana: grafana.spark.cg-rookies.net
+  searxng: search.spark.cg-rookies.net
+  traefik: traefik.spark.cg-rookies.net
+
+network:
+  name: dgx-llm-net
+  bind_ip: 192.168.111.1
+
+gpu:
+  default_headroom: 0.08
+  max_fraction_per_gpu: 0.92
+  allowed_device_ids: ["0"]
+
+images:
+  vllm_default: vllm-node
+  litellm: ghcr.io/berriai/litellm:main-latest
+  openwebui: ghcr.io/open-webui/open-webui:main
+  traefik: traefik:v3.6
+  prometheus: prom/prometheus:latest
+  grafana: grafana/grafana-oss:latest
+  browserless: ghcr.io/browserless/chromium:latest
+  searxng: searxng/searxng:latest
+  valkey: valkey/valkey:9-alpine
+  node_exporter: prom/node-exporter:latest
+  cadvisor: gcr.io/cadvisor/cadvisor:latest
+
+paths:
+  hf_cache: /home/ymin/.cache/huggingface
+  vllm_cache: /home/ymin/.cache/vllm
+  flashinfer_cache: /home/ymin/.cache/flashinfer
+  triton_cache: /home/ymin/.triton
+  logs: /data/logs/dgx-llm-stack
+
+secrets:
+  remote_env_file: /opt/dgx-llm-stack/.env
+  existing_hf_token_file: /home/ymin/spark-vllm-docker/HF-tk.env
+
+services:
+  traefik:
+    enabled: true
+    host_port: 80
+    dashboard: false
+
+  litellm:
+    enabled: true
+    auth_enabled: false
+    internal_port: 4000
+    expose_host: true
+    host_port: 4000
+
+  openwebui:
+    enabled: true
+    internal_port: 8080
+    expose_host: true
+    host_port: 3000
+    volume_name: open-webui
+    bypass_model_access_control: true
+
+  grafana:
+    enabled: true
+    internal_port: 3000
+    expose_host: true
+    host_port: 3300
+    volume_name: spark-system-dashboard_grafana-data
+
+  prometheus:
+    enabled: true
+    internal_port: 9090
+    expose_host: false
+    volume_name: spark-system-dashboard_prometheus-data
+
+  browserless:
+    enabled: true
+    internal_port: 3000
+    expose_host: true
+    host_port: 3003
+
+  searxng:
+    enabled: true
+    internal_port: 8080
+    expose_host: true
+    host_port: 8888
+    core_volume_name: searxng_core-data
+    valkey_volume_name: searxng_valkey-data
+
+  exporters:
+    enabled: true
+
+legacy:
+  stop_on_apply: true
+  containers:
+    - open-webui
+    - browserless
+    - searxng-core
+    - searxng-valkey
+    - vllm_serve
+    - spark-grafana
+    - spark-prometheus
+    - spark-cadvisor
+    - spark-node-exporter
+    - spark-gpu-exporter

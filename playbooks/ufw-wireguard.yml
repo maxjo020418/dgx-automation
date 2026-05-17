@@ -1,0 +1,35 @@
+- name: Apply WireGuard-scoped UFW rules for DGX LLM stack
+  hosts: dgx
+  become: true
+  vars_files:
+    - ../stack.yml
+  vars:
+    close_raw_vllm: true
+  tasks:
+    - name: Allow Traefik over WireGuard
+      ansible.builtin.command:
+        cmd: >-
+          ufw allow in on wg0 to {{ network.bind_ip }} port {{ services.traefik.host_port }}
+          proto tcp comment 'DGX stack Traefik over WireGuard'
+      when: services.traefik.enabled | bool
+
+    - name: Allow direct service ports over WireGuard
+      ansible.builtin.command:
+        cmd: >-
+          ufw allow in on wg0 to {{ network.bind_ip }} port {{ item.port }}
+          proto tcp comment '{{ item.comment }}'
+      loop:
+        - { port: "{{ services.openwebui.host_port }}", enabled: "{{ services.openwebui.enabled and services.openwebui.expose_host }}", comment: "DGX OpenWebUI over WireGuard" }
+        - { port: "{{ services.litellm.host_port }}", enabled: "{{ services.litellm.enabled and services.litellm.expose_host }}", comment: "DGX LiteLLM over WireGuard" }
+        - { port: "{{ services.grafana.host_port }}", enabled: "{{ services.grafana.enabled and services.grafana.expose_host }}", comment: "DGX Grafana over WireGuard" }
+        - { port: "{{ services.browserless.host_port }}", enabled: "{{ services.browserless.enabled and services.browserless.expose_host }}", comment: "DGX browserless over WireGuard" }
+        - { port: "{{ services.searxng.host_port }}", enabled: "{{ services.searxng.enabled and services.searxng.expose_host }}", comment: "DGX SearXNG over WireGuard" }
+      when: item.enabled | bool
+
+    - name: Close legacy raw vLLM WireGuard port
+      ansible.builtin.command:
+        cmd: ufw delete allow in on wg0 to any port 8000 proto tcp
+      register: delete_vllm_ufw
+      changed_when: delete_vllm_ufw.rc == 0
+      failed_when: false
+      when: close_raw_vllm | bool

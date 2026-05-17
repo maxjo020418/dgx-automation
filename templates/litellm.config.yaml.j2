@@ -1,0 +1,37 @@
+{{ header }}
+model_list:
+{% for model in models %}
+{% for served_name in model.served_names %}
+  - model_name: {{ served_name }}
+    litellm_params:
+      model: openai/{{ served_name }}
+      api_base: http://{{ model.container_name }}:{{ model.routing.internal_port }}/v1
+      api_key: dummy
+{% if model.litellm.extra_body is defined %}
+      extra_body:
+{{ model.litellm.extra_body | yaml(8) }}
+{% endif %}
+    model_info:
+      id: {{ model.id }}
+      mode: {{ model.litellm.mode }}
+      base_model: {{ model.hf_model }}
+{% if model.vllm.max_model_len is defined %}
+      max_input_tokens: {{ model.vllm.max_model_len }}
+{% endif %}
+{% if model.litellm.input_cost_per_token is defined %}
+      input_cost_per_token: {{ model.litellm.input_cost_per_token }}
+{% endif %}
+{% if model.litellm.output_cost_per_token is defined %}
+      output_cost_per_token: {{ model.litellm.output_cost_per_token }}
+{% endif %}
+{% endfor %}
+{% endfor %}
+
+{% if stack.services.litellm.auth_enabled | default(true) %}
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+{% endif %}
+
+litellm_settings:
+  request_timeout: 600
+  drop_params: false
