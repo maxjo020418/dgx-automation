@@ -3,8 +3,7 @@
   become: true
   vars_files:
     - ../stack.yml
-  vars:
-    close_raw_vllm: true
+    - ../models.yml
   tasks:
     - name: Allow Traefik over WireGuard
       ansible.builtin.command:
@@ -26,10 +25,53 @@
         - { port: "{{ services.searxng.host_port }}", enabled: "{{ services.searxng.enabled and services.searxng.expose_host }}", comment: "DGX SearXNG over WireGuard" }
       when: item.enabled | bool
 
-    - name: Close legacy raw vLLM WireGuard port
+    - name: Remove disabled direct service ports over WireGuard
+      ansible.builtin.command:
+        cmd: >-
+          ufw delete allow in on wg0 to {{ network.bind_ip }} port {{ item.port }}
+          proto tcp
+      loop:
+        - { port: "{{ services.openwebui.host_port }}", enabled: "{{ services.openwebui.enabled and services.openwebui.expose_host }}" }
+        - { port: "{{ services.litellm.host_port }}", enabled: "{{ services.litellm.enabled and services.litellm.expose_host }}" }
+        - { port: "{{ services.grafana.host_port }}", enabled: "{{ services.grafana.enabled and services.grafana.expose_host }}" }
+        - { port: "{{ services.browserless.host_port }}", enabled: "{{ services.browserless.enabled and services.browserless.expose_host }}" }
+        - { port: "{{ services.searxng.host_port }}", enabled: "{{ services.searxng.enabled and services.searxng.expose_host }}" }
+      register: delete_direct_service_ufw
+      changed_when: delete_direct_service_ufw.rc == 0
+      failed_when: false
+      when: not (item.enabled | bool)
+
+    - name: Allow exposed model ports over WireGuard
+      ansible.builtin.command:
+        cmd: >-
+          ufw allow in on wg0 to {{ network.bind_ip }} port {{ item.routing.host_port }}
+          proto tcp comment 'DGX {{ item.id }} over WireGuard'
+      loop: "{{ models }}"
+      loop_control:
+        label: "{{ item.id }}"
+      when:
+        - item.enabled | default(true) | bool
+        - item.routing is defined
+        - item.routing.expose_host | default(false) | bool
+
+    - name: Remove disabled model ports over WireGuard
+      ansible.builtin.command:
+        cmd: >-
+          ufw delete allow in on wg0 to {{ network.bind_ip }} port {{ item.routing.host_port }}
+          proto tcp
+      loop: "{{ models }}"
+      loop_control:
+        label: "{{ item.id }}"
+      register: delete_model_ufw
+      changed_when: delete_model_ufw.rc == 0
+      failed_when: false
+      when:
+        - item.routing is defined
+        - not ((item.enabled | default(true) | bool) and (item.routing.expose_host | default(false) | bool))
+
+    - name: Remove legacy raw vLLM WireGuard port
       ansible.builtin.command:
         cmd: ufw delete allow in on wg0 to any port 8000 proto tcp
-      register: delete_vllm_ufw
-      changed_when: delete_vllm_ufw.rc == 0
+      register: delete_legacy_vllm_ufw
+      changed_when: delete_legacy_vllm_ufw.rc == 0
       failed_when: false
-      when: close_raw_vllm | bool

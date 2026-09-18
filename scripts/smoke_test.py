@@ -37,7 +37,7 @@ def remote_curl(user: str, host: str, url: str, headers: dict[str, str] | None =
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="spark.cg-rookies.net")
+    parser.add_argument("--host", default="pika.ihopper.co.kr")
     parser.add_argument("--ssh-user", default="ymin")
     args = parser.parse_args()
 
@@ -84,21 +84,34 @@ def main() -> int:
 
     if master_key or not litellm_auth_enabled:
         for model in models_doc.get("models", []):
-            if not model.get("enabled", True) or model.get("kind") != "chat":
+            if not model.get("enabled", True):
                 continue
             served_name = model["served_names"][0]
-            payload = {
-                "model": served_name,
-                "messages": [{"role": "user", "content": "Say OK only."}],
-                "max_tokens": 8,
-            }
+            mode = model.get("litellm", {}).get("mode", model.get("kind", "chat"))
+            if mode == "chat":
+                payload = {
+                    "model": served_name,
+                    "messages": [{"role": "user", "content": "Say OK only."}],
+                    "max_tokens": 8,
+                }
+                path = "/v1/chat/completions"
+                label = "chat completion"
+            elif mode == "embedding":
+                payload = {
+                    "model": served_name,
+                    "input": ["DGX automation smoke test."],
+                }
+                path = "/v1/embeddings"
+                label = "embedding"
+            else:
+                continue
             extra_body = model.get("litellm", {}).get("extra_body")
             if extra_body:
                 payload.update(extra_body)
             code, output = remote_curl(
                 args.ssh_user,
                 args.host,
-                f"http://{bind_ip}:{stack['services']['litellm']['host_port']}/v1/chat/completions",
+                f"http://{bind_ip}:{stack['services']['litellm']['host_port']}{path}",
                 headers={
                     **({"Authorization": f"Bearer {master_key}"} if master_key else {}),
                     "Content-Type": "application/json",
@@ -106,12 +119,12 @@ def main() -> int:
                 data=payload,
             )
             if code == 0:
-                print(f"OK: chat completion {served_name}")
+                print(f"OK: {label} {served_name}")
             else:
-                print(f"ERROR: chat completion {served_name}: {output.strip()}", file=sys.stderr)
-                failures.append(f"chat:{served_name}")
+                print(f"ERROR: {label} {served_name}: {output.strip()}", file=sys.stderr)
+                failures.append(f"{mode}:{served_name}")
     else:
-        print("WARN: no LITELLM_MASTER_KEY found; skipped model completion smoke")
+        print("WARN: no LITELLM_MASTER_KEY found; skipped model smoke")
 
     return 1 if failures else 0
 

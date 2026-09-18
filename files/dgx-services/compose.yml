@@ -1,0 +1,282 @@
+# Seed-only DGX services compose. Copied to /opt/dgx-services/compose.yml only
+# when that file is missing; edit the remote file for persistent service changes.
+name: dgx-services
+
+services:
+  traefik:
+    image: traefik:v3.6
+    container_name: dgx-traefik
+    restart: unless-stopped
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.file.filename=/etc/traefik/dynamic.yml"
+      - "--providers.file.watch=true"
+      - "--entrypoints.web.address=:80"
+      - "--api=true"
+      - "--api.dashboard=true"
+      - "--api.basepath=/traefik"
+      - "--ping=true"
+    ports:
+      - "10.90.0.103:80:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik-dynamic.yml:/etc/traefik/dynamic.yml:ro
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    networks:
+      - dgx-llm-net
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:v0.10.2
+    container_name: open-webui
+    restart: unless-stopped
+    env_file:
+      - ${DGX_ENV_FILE:-.env}
+    environment:
+      ENABLE_OPENAI_API: "true"
+      OPENAI_API_BASE_URL: "http://litellm:4000/v1"
+      OPENAI_API_BASE_URLS: "http://litellm:4000/v1"
+      WEBUI_URL: "https://pika.ihopper.co.kr/"
+      OPENAI_API_KEY: "not-needed"
+      OPENAI_API_KEYS: "not-needed"
+      BYPASS_MODEL_ACCESS_CONTROL: "true"
+      RAG_EMBEDDING_BATCH_SIZE: "16"
+      ENABLE_ASYNC_EMBEDDING: "true"
+      RAG_EMBEDDING_CONCURRENT_REQUESTS: "4"
+      ENABLE_WEB_SEARCH: "true"
+      WEB_SEARCH_ENGINE: searxng
+      WEB_SEARCH_RESULT_COUNT: "3"
+      WEB_SEARCH_CONCURRENT_REQUESTS: "2"
+      BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL: "false"
+      BYPASS_WEB_SEARCH_WEB_LOADER: "false"
+      SEARXNG_QUERY_URL: "http://searxng:8080/search"
+      WEB_LOADER_ENGINE: playwright
+      WEB_LOADER_CONCURRENT_REQUESTS: "4"
+      PLAYWRIGHT_WS_URL: "ws://browserless:3000/playwright/chromium"
+      PLAYWRIGHT_TIMEOUT: "20000"
+      DEFAULT_MODELS: "gemma-4-26b-NVFP4-MTP"
+    volumes:
+      - open-webui-data:/app/backend/data
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "pika.ihopper.co.kr:10.90.0.103"
+      - "chat.pika.ihopper.co.kr:10.90.0.103"
+      - "grafana.pika.ihopper.co.kr:10.90.0.103"
+      - "search.pika.ihopper.co.kr:10.90.0.103"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --max-time 3 http://127.0.0.1:8080/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - dgx-llm-net
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: dgx-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - prometheus-data:/prometheus
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - "/opt/dgx-llm-stack/prometheus-vllm-targets.yml:/etc/prometheus/targets/vllm.yml:ro"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider --timeout=3 http://127.0.0.1:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    networks:
+      - dgx-llm-net
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: dgx-grafana
+    restart: unless-stopped
+    env_file:
+      - ${DGX_ENV_FILE:-.env}
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD}"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_DEFAULT_THEME: system
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: "1s"
+      GF_SERVER_DOMAIN: "pika.ihopper.co.kr"
+      GF_SERVER_ROOT_URL: "https://pika.ihopper.co.kr/grafana/"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --max-time 3 http://127.0.0.1:3000/api/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - dgx-llm-net
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: dgx-node-exporter
+    restart: unless-stopped
+    pid: host
+    command:
+      - "--web.listen-address=:9100"
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/host"
+      - "--collector.filesystem.mount-points-exclude=^/(dev|proc|run/credentials/.+|sys|var/lib/docker/.+|var/lib/containers/storage/.+)($|/)"
+      - "--collector.filesystem.fs-types-exclude=^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|mqueue|nsfs|overlay|proc|pstore|rpc_pipefs|securityfs|sysfs|tracefs)$"
+    read_only: true
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host:ro,rslave
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider --timeout=3 http://127.0.0.1:9100/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    networks:
+      - dgx-llm-net
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: dgx-cadvisor
+    restart: unless-stopped
+    privileged: true
+    command:
+      - "--port=8089"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider --timeout=3 http://127.0.0.1:8089/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    networks:
+      - dgx-llm-net
+
+  gpu-exporter:
+    build:
+      context: ./gpu-exporter
+    image: dgx-gpu-exporter:local
+    container_name: dgx-gpu-exporter
+    restart: unless-stopped
+    gpus: all
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      GPU_EXPORTER_LISTEN_ADDR: 0.0.0.0
+      GPU_EXPORTER_PORT: 9400
+    volumes:
+      - /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:9400/metrics\", timeout=3).read()'"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    networks:
+      - dgx-llm-net
+
+  browserless:
+    image: ghcr.io/browserless/chromium:latest
+    container_name: browserless
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --max-time 5 http://127.0.0.1:3000/json/version >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - dgx-llm-net
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng-core
+    restart: unless-stopped
+    env_file:
+      - ${DGX_ENV_FILE:-.env}
+    environment:
+      SEARXNG_BASE_URL: "https://pika.ihopper.co.kr/searxng/"
+      SEARXNG_SECRET_KEY: "${SEARXNG_SECRET_KEY}"
+      SEARXNG_VALKEY_URL: "valkey://searxng-valkey:6379/0"
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./searxng:/etc/searxng
+      - searxng-core-data:/var/cache/searxng
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider --timeout=3 http://127.0.0.1:8080/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    depends_on:
+      - searxng-valkey
+    networks:
+      - dgx-llm-net
+
+  searxng-valkey:
+    image: valkey/valkey:9-alpine
+    container_name: searxng-valkey
+    restart: unless-stopped
+    command: ["valkey-server", "--save", "30", "1", "--loglevel", "warning"]
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    volumes:
+      - searxng-valkey-data:/data
+    networks:
+      - dgx-llm-net
+
+networks:
+  dgx-llm-net:
+    name: dgx-llm-net
+    external: true
+
+volumes:
+  open-webui-data:
+    external: true
+    name: open-webui
+  prometheus-data:
+    external: true
+    name: spark-system-dashboard_prometheus-data
+  grafana-data:
+    external: true
+    name: spark-system-dashboard_grafana-data
+  searxng-core-data:
+    external: true
+    name: searxng_core-data
+  searxng-valkey-data:
+    external: true
+    name: searxng_valkey-data

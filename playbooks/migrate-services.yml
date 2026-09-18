@@ -1,0 +1,323 @@
+- name: Migrate DGX support services to local Compose stack
+  hosts: dgx
+  become: true
+  vars_files:
+    - ../stack.yml
+  vars:
+    services_dir: /opt/dgx-services
+    services_project_name: dgx-services
+    services_owner: "{{ ansible_user | default(ansible_user_id) }}"
+    pull_images: true
+    compose_up: true
+    release_id: "{{ ansible_date_time.iso8601_basic_short }}"
+    release_retention_keep: "{{ deployment.release_retention.keep | default(5) | int }}"
+
+  tasks:
+    - name: Ensure service directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ deploy_dir }}"
+        - "{{ services_dir }}"
+        - "{{ services_dir }}/releases"
+        - "{{ services_dir }}/grafana/provisioning/datasources"
+        - "{{ services_dir }}/grafana/provisioning/dashboards"
+        - "{{ services_dir }}/grafana/dashboards"
+        - "{{ services_dir }}/searxng"
+        - "{{ services_dir }}/gpu-exporter"
+
+    - name: Check services environment file
+      ansible.builtin.stat:
+        path: "{{ services_dir }}/.env"
+      register: services_env_file
+
+    - name: Check existing LLM environment file
+      ansible.builtin.stat:
+        path: "{{ deploy_dir }}/.env"
+      register: llm_env_file
+
+    - name: Seed services environment from current LLM stack
+      ansible.builtin.copy:
+        src: "{{ deploy_dir }}/.env"
+        dest: "{{ services_dir }}/.env"
+        remote_src: true
+        mode: "0600"
+        force: false
+      when:
+        - not services_env_file.stat.exists
+        - llm_env_file.stat.exists
+
+    - name: Install initial services environment file when missing
+      ansible.builtin.copy:
+        src: ../.env.example
+        dest: "{{ services_dir }}/.env"
+        mode: "0600"
+        force: false
+      when:
+        - not services_env_file.stat.exists
+        - not llm_env_file.stat.exists
+
+    - name: Ensure services runtime secrets exist
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import secrets
+        from pathlib import Path
+
+        env_path = Path("{{ services_dir }}/.env")
+        llm_env_path = Path("{{ deploy_dir }}/.env")
+
+        def read_env(path):
+            env = {}
+            order = []
+            if path.exists():
+                for raw in path.read_text().splitlines():
+                    if "=" in raw and not raw.lstrip().startswith("#"):
+                        key, value = raw.split("=", 1)
+                        env[key] = value
+                        order.append(key)
+            return env, order
+
+        env, order = read_env(env_path)
+        llm_env, _ = read_env(llm_env_path)
+
+        def set_default(key, value, replace_values=("", "change-me-before-use")):
+            if env.get(key, "") in replace_values:
+                env[key] = value
+                if key not in order:
+                    order.append(key)
+
+        if {{ 'True' if services.litellm.auth_enabled | default(true) | bool else 'False' }}:
+            set_default("LITELLM_MASTER_KEY", llm_env.get("LITELLM_MASTER_KEY") or "sk-" + secrets.token_hex(32))
+        set_default("GRAFANA_ADMIN_PASSWORD", secrets.token_urlsafe(24))
+        set_default("SEARXNG_SECRET_KEY", secrets.token_urlsafe(32))
+        if not env.get("GRAFANA_ADMIN_USER"):
+            env["GRAFANA_ADMIN_USER"] = "admin"
+            order.append("GRAFANA_ADMIN_USER")
+
+        seen = set()
+        lines = []
+        for key in order:
+            if key in env and key not in seen:
+                lines.append(f"{key}={env[key]}")
+                seen.add(key)
+        for key in sorted(set(env) - seen):
+            lines.append(f"{key}={env[key]}")
+        env_path.write_text("\n".join(lines) + "\n")
+        env_path.chmod(0o600)
+        PY
+      args:
+        executable: /bin/bash
+      changed_when: false
+      no_log: true
+      when: not ansible_check_mode
+
+    - name: Ensure shared Docker network exists
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if docker network inspect "{{ network.name }}" >/dev/null 2>&1; then
+          echo exists
+        else
+          docker network create "{{ network.name }}"
+          echo created
+        fi
+      args:
+        executable: /bin/bash
+      register: shared_network
+      changed_when: "'created' in shared_network.stdout"
+      when: not ansible_check_mode
+
+    - name: Ensure external service volumes exist
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if docker volume inspect "{{ item }}" >/dev/null 2>&1; then
+          echo exists
+        else
+          docker volume create "{{ item }}" >/dev/null
+          echo created
+        fi
+      args:
+        executable: /bin/bash
+      loop:
+        - "{{ services.openwebui.volume_name }}"
+        - "{{ services.prometheus.volume_name }}"
+        - "{{ services.grafana.volume_name }}"
+        - "{{ services.searxng.core_volume_name }}"
+        - "{{ services.searxng.valkey_volume_name }}"
+      register: service_volumes
+      changed_when: "'created' in service_volumes.stdout"
+      when: not ansible_check_mode
+
+    - name: Create service release archive directory
+      ansible.builtin.file:
+        path: "{{ services_dir }}/releases/{{ release_id }}"
+        state: directory
+        mode: "0755"
+      when: compose_up | bool
+
+    - name: Archive previous service runtime files when present
+      ansible.builtin.shell: |
+        set -euo pipefail
+        for path in compose.yml traefik-dynamic.yml prometheus.yml .env grafana searxng gpu-exporter; do
+          if [ -e "{{ services_dir }}/${path}" ]; then
+            cp -a "{{ services_dir }}/${path}" "{{ services_dir }}/releases/{{ release_id }}/${path}"
+          fi
+        done
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when:
+        - compose_up | bool
+        - not ansible_check_mode
+
+    - name: Prune old service release archives
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import shutil
+        from pathlib import Path
+
+        keep = max(1, int("{{ release_retention_keep }}"))
+        releases = Path("{{ services_dir }}/releases")
+        entries = [path for path in releases.iterdir() if path.name not in (".", "..")]
+        entries.sort(key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
+        stale = entries[keep:]
+        for path in stale:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        print(f"deleted={len(stale)} kept={min(len(entries), keep)}")
+        PY
+      args:
+        executable: /bin/bash
+      register: prune_service_release_archives
+      changed_when: "'deleted=0' not in prune_service_release_archives.stdout"
+      when:
+        - compose_up | bool
+        - release_retention_keep | int > 0
+        - not ansible_check_mode
+
+    - name: Seed services compose when missing
+      ansible.builtin.copy:
+        src: ../files/dgx-services/compose.yml
+        dest: "{{ services_dir }}/compose.yml"
+        mode: "0644"
+        force: false
+
+    - name: Seed Traefik dynamic config when missing
+      ansible.builtin.copy:
+        src: ../files/dgx-services/traefik-dynamic.yml
+        dest: "{{ services_dir }}/traefik-dynamic.yml"
+        mode: "0644"
+        force: false
+
+    - name: Seed Prometheus vLLM target file when missing
+      ansible.builtin.copy:
+        content: "[]\n"
+        dest: "{{ deploy_dir }}/prometheus-vllm-targets.yml"
+        mode: "0644"
+        force: false
+
+    - name: Seed static service files when missing
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "{{ item.mode }}"
+        force: false
+      loop:
+        - { src: "../files/prometheus.yml", dest: "{{ services_dir }}/prometheus.yml", mode: "0644" }
+        - { src: "../files/grafana/provisioning/datasources/prometheus.yml", dest: "{{ services_dir }}/grafana/provisioning/datasources/prometheus.yml", mode: "0644" }
+        - { src: "../files/grafana/provisioning/dashboards/dashboards.yml", dest: "{{ services_dir }}/grafana/provisioning/dashboards/dashboards.yml", mode: "0644" }
+        - { src: "../files/grafana/dashboards/spark-system-vllm.json", dest: "{{ services_dir }}/grafana/dashboards/spark-system-vllm.json", mode: "0644" }
+        - { src: "../files/searxng/settings.yml", dest: "{{ services_dir }}/searxng/settings.yml", mode: "0644" }
+        - { src: "../files/gpu-exporter/Dockerfile", dest: "{{ services_dir }}/gpu-exporter/Dockerfile", mode: "0644" }
+        - { src: "../files/gpu-exporter/gpu_exporter.py", dest: "{{ services_dir }}/gpu-exporter/gpu_exporter.py", mode: "0755" }
+
+    - name: Allow deploy user to manage service files
+      ansible.builtin.file:
+        path: "{{ services_dir }}"
+        owner: "{{ services_owner }}"
+        recurse: true
+      when: compose_up | bool
+
+    - name: Check services Docker Compose config
+      ansible.builtin.command:
+        cmd: docker compose -p {{ services_project_name }} -f compose.yml config
+        chdir: "{{ services_dir }}"
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Pull service images
+      ansible.builtin.command:
+        cmd: docker compose -p {{ services_project_name }} -f compose.yml pull --ignore-buildable --ignore-pull-failures
+        chdir: "{{ services_dir }}"
+      register: service_pull_result
+      failed_when: false
+      changed_when: service_pull_result.rc == 0
+      when:
+        - pull_images | bool
+        - not ansible_check_mode
+
+    - name: Remove conflicting legacy service containers
+      ansible.builtin.shell: |
+        set -euo pipefail
+        removed=0
+        for name in \
+          dgx-traefik \
+          open-webui \
+          dgx-prometheus \
+          dgx-grafana \
+          dgx-node-exporter \
+          dgx-cadvisor \
+          dgx-gpu-exporter \
+          browserless \
+          searxng-core \
+          searxng-valkey; do
+          if ! docker container inspect "$name" >/dev/null 2>&1; then
+            continue
+          fi
+          project="$(docker inspect -f '{% raw %}{{ index .Config.Labels "com.docker.compose.project" }}{% endraw %}' "$name" 2>/dev/null || true)"
+          if [ "$project" != "{{ services_project_name }}" ]; then
+            docker rm -f "$name" >/dev/null
+            echo "removed ${name} project=${project:-none}"
+            removed=1
+          fi
+        done
+        if [ "$removed" -eq 0 ]; then
+          echo none
+        fi
+      args:
+        executable: /bin/bash
+      register: legacy_service_removal
+      changed_when: "'removed ' in legacy_service_removal.stdout"
+      when:
+        - compose_up | bool
+        - not ansible_check_mode
+
+    - name: Apply services Compose stack
+      ansible.builtin.command:
+        cmd: docker compose -p {{ services_project_name }} -f compose.yml up -d --build --remove-orphans
+        chdir: "{{ services_dir }}"
+      when:
+        - compose_up | bool
+        - not ansible_check_mode
+
+    - name: Wait for Traefik dashboard route
+      ansible.builtin.uri:
+        url: "http://{{ network.bind_ip }}:{{ services.traefik.host_port }}/traefik/dashboard/"
+        headers:
+          Host: "{{ domain.base }}"
+        method: GET
+        status_code: [200, 301, 302]
+      register: traefik_dashboard
+      retries: 20
+      delay: 3
+      until: traefik_dashboard.status in [200, 301, 302]
+      when:
+        - services.traefik.enabled | bool
+        - services.traefik.dashboard | bool
+        - compose_up | bool
+        - not ansible_check_mode

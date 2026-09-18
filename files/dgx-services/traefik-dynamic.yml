@@ -1,0 +1,122 @@
+# Seed-only Traefik dynamic config. Copied to /opt/dgx-services/traefik-dynamic.yml
+# only when that file is missing; edit the remote file for persistent route changes.
+http:
+  routers:
+    traefik-dashboard:
+      rule: "Host(`pika.ihopper.co.kr`) && PathPrefix(`/traefik`)"
+      entryPoints:
+        - web
+      priority: 100
+      service: api@internal
+      middlewares:
+        - secure-headers
+    litellm:
+      rule: "Host(`pika.ihopper.co.kr`) && PathPrefix(`/llm`)"
+      entryPoints:
+        - web
+      priority: 100
+      service: litellm
+      middlewares:
+        - litellm-strip
+        - secure-headers
+    grafana:
+      rule: "Host(`pika.ihopper.co.kr`) && PathPrefix(`/grafana`)"
+      entryPoints:
+        - web
+      priority: 100
+      service: grafana
+      middlewares:
+        - secure-headers
+    searxng:
+      rule: "Host(`pika.ihopper.co.kr`) && PathPrefix(`/searxng`)"
+      entryPoints:
+        - web
+      priority: 100
+      service: searxng
+      middlewares:
+        - searxng-strip
+        - secure-headers
+    ocr-vlm:
+      rule: "Host(`pika.ihopper.co.kr`) && PathPrefix(`/ocr-vlm`)"
+      entryPoints:
+        - web
+      priority: 100
+      service: ocr-vlm
+      middlewares:
+        - secure-headers
+    paddlex:
+      rule: "Host(`pika.ihopper.co.kr`) && PathPrefix(`/paddlex`)"
+      entryPoints:
+        - web
+      priority: 100
+      service: paddlex
+      middlewares:
+        - paddlex-strip
+        - paddlex-prefix-headers
+        - secure-headers
+    paddlex-openapi:
+      rule: "Host(`pika.ihopper.co.kr`) && (Path(`/openapi.json`) || Path(`/docs/oauth2-redirect`))"
+      entryPoints:
+        - web
+      priority: 100
+      service: paddlex
+      middlewares:
+        - paddlex-prefix-headers
+        - secure-headers
+    openwebui:
+      rule: "Host(`pika.ihopper.co.kr`) && PathPrefix(`/`)"
+      entryPoints:
+        - web
+      priority: 1
+      service: openwebui
+      middlewares:
+        - secure-headers
+
+  services:
+    litellm:
+      loadBalancer:
+        servers:
+          - url: "http://litellm:4000"
+    grafana:
+      loadBalancer:
+        servers:
+          - url: "http://grafana:3000"
+    searxng:
+      loadBalancer:
+        servers:
+          - url: "http://searxng:8080"
+    ocr-vlm:
+      loadBalancer:
+        servers:
+          - url: "http://ocr-vlm-orchestrator:8093"
+    paddlex:
+      loadBalancer:
+        servers:
+          - url: "http://paddle-structurev3:8081"
+    openwebui:
+      loadBalancer:
+        servers:
+          - url: "http://open-webui:8080"
+
+  middlewares:
+    litellm-strip:
+      stripPrefix:
+        prefixes:
+          - /llm
+    searxng-strip:
+      stripPrefix:
+        prefixes:
+          - /searxng
+    paddlex-strip:
+      stripPrefix:
+        prefixes:
+          - /paddlex
+    paddlex-prefix-headers:
+      headers:
+        customRequestHeaders:
+          X-Forwarded-Prefix: /paddlex
+    secure-headers:
+      headers:
+        frameDeny: true
+        contentTypeNosniff: true
+        browserXssFilter: true

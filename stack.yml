@@ -2,26 +2,39 @@ project_name: dgxllm
 deploy_dir: /opt/dgx-llm-stack
 
 domain:
-  base: spark.cg-rookies.net
-  openwebui: chat.spark.cg-rookies.net
-  litellm: api.spark.cg-rookies.net
-  grafana: grafana.spark.cg-rookies.net
-  searxng: search.spark.cg-rookies.net
-  traefik: traefik.spark.cg-rookies.net
+  base: pika.ihopper.co.kr
+  openwebui: chat.pika.ihopper.co.kr
+  litellm: api.pika.ihopper.co.kr
+  grafana: grafana.pika.ihopper.co.kr
+  searxng: search.pika.ihopper.co.kr
+  traefik: traefik.pika.ihopper.co.kr
 
 network:
   name: dgx-llm-net
-  bind_ip: 192.168.111.1
+  bind_ip: 10.90.0.103
 
 gpu:
-  default_headroom: 0.08
-  max_fraction_per_gpu: 0.92
+  default_headroom: 0.2
+  max_fraction_per_gpu: 0.8
+  validate_memory_fraction_budget: true
   allowed_device_ids: ["0"]
+
+deployment:
+  release_retention:
+    keep: 5
+  vllm:
+    launcher_dir: /home/ymin/spark-vllm-docker
+    launcher_home: /home/ymin
+    earlyoom: true
+    staggered_start: true
+    startup_timeout_seconds: 1800
+    startup_poll_seconds: 5
+    startup_settle_seconds: 10
 
 images:
   vllm_default: vllm-node
   litellm: ghcr.io/berriai/litellm:main-latest
-  openwebui: ghcr.io/open-webui/open-webui:main
+  openwebui: ghcr.io/open-webui/open-webui:v0.10.2
   traefik: traefik:v3.6
   prometheus: prom/prometheus:latest
   grafana: grafana/grafana-oss:latest
@@ -46,27 +59,39 @@ services:
   traefik:
     enabled: true
     host_port: 80
-    dashboard: false
+    dashboard: true
 
   litellm:
     enabled: true
     auth_enabled: false
     internal_port: 4000
-    expose_host: true
+    expose_host: false
     host_port: 4000
 
   openwebui:
     enabled: true
     internal_port: 8080
-    expose_host: true
+    expose_host: false
     host_port: 3000
     volume_name: open-webui
     bypass_model_access_control: true
+    embedding:
+      batch_size: 16
+      enable_async: true
+      concurrent_requests: 4
+    web_search:
+      result_count: 3
+      concurrent_requests: 2
+      bypass_embedding_and_retrieval: false
+      bypass_web_loader: false
+    web_loader:
+      concurrent_requests: 4
+      playwright_timeout: 20000
 
   grafana:
     enabled: true
     internal_port: 3000
-    expose_host: true
+    expose_host: false
     host_port: 3300
     volume_name: spark-system-dashboard_grafana-data
 
@@ -79,30 +104,16 @@ services:
   browserless:
     enabled: true
     internal_port: 3000
-    expose_host: true
+    expose_host: false
     host_port: 3003
 
   searxng:
     enabled: true
     internal_port: 8080
-    expose_host: true
+    expose_host: false
     host_port: 8888
     core_volume_name: searxng_core-data
     valkey_volume_name: searxng_valkey-data
 
   exporters:
     enabled: true
-
-legacy:
-  stop_on_apply: true
-  containers:
-    - open-webui
-    - browserless
-    - searxng-core
-    - searxng-valkey
-    - vllm_serve
-    - spark-grafana
-    - spark-prometheus
-    - spark-cadvisor
-    - spark-node-exporter
-    - spark-gpu-exporter

@@ -1,5 +1,5 @@
 models:
-  - id: gemma-4-26b
+  - id: gemma-4-26b-nvfp4-mtp
     enabled: true
     kind: chat
     backend: vllm
@@ -7,29 +7,43 @@ models:
     pull_policy: never
     hf_model: nvidia/Gemma-4-26B-A4B-NVFP4
     served_names:
-      - gemma-4-26b
+      - gemma-4-26b-NVFP4-MTP
 
     gpu:
       device_ids: ["0"]
-      memory_fraction: 0.71
+      memory_fraction: 0.45
 
     vllm:
-      max_model_len: 262144
-      max_num_seqs: 32
-      max_num_batched_tokens: 32768
+      recipe: recipes/gemma4-26b-a4b-nvfp4.yaml
+      max_model_len: 131072
+      max_num_seqs: 64
+      max_num_batched_tokens: 8192
+      tensor_parallel_size: 1
+      load_format: instanttensor
+      mm_processor_kwargs:
+        max_soft_tokens: 1120
       kv_cache_dtype: fp8
-      quantization: modelopt
       trust_remote_code: true
       enable_auto_tool_choice: true
       enable_prefix_caching: true
+      enable_chunked_prefill: true
+      generation_config: vllm
+      speculative_config:
+        method: mtp
+        model: google/gemma-4-26B-A4B-it-assistant
+        num_speculative_tokens: 4
+        moe_backend: triton
       tool_call_parser: gemma4
       reasoning_parser: gemma4
-      chat_template: chat-templates/tool_chat_template_gemma4.jinja
+      engine_args:
+        structured_outputs_config:
+          backend: xgrammar
+          disable_any_whitespace: true
       extra_args: []
 
     routing:
       internal_port: 8000
-      host_port: 8101
+      host_port: 8102
       expose_host: false
       expose_publicly: false
 
@@ -37,6 +51,294 @@ models:
       mode: chat
       input_cost_per_token: 0
       output_cost_per_token: 0
-      extra_body:
-        chat_template_kwargs:
-          enable_thinking: true
+      # extra_body:
+      #   chat_template_kwargs:
+      #     enable_thinking: true
+
+
+  - id: gemma-4-12b-nvfp4-mtp
+    enabled: false
+    kind: chat
+    backend: vllm
+    image: vllm-node
+    pull_policy: never
+    hf_model: AxionML/Gemma-4-12B-NVFP4
+    served_names:
+      - gemma-4-12b-NVFP4-MTP
+
+    gpu:
+      device_ids: ["0"]
+      memory_fraction: 0.4
+
+    vllm:
+      tensor_parallel_size: 1
+      max_model_len: 131072
+      max_num_batched_tokens: 8192
+      mm_processor_kwargs:
+        max_soft_tokens: 1120
+      quantization: modelopt_fp4
+      trust_remote_code: true
+      enable_auto_tool_choice: true
+      enable_prefix_caching: true
+      enable_chunked_prefill: true
+      speculative_config:
+        method: mtp
+        model: google/gemma-4-12B-it-assistant
+        num_speculative_tokens: 4
+      tool_call_parser: gemma4
+      reasoning_parser: gemma4
+      engine_args:
+        structured_outputs_config:
+          backend: xgrammar
+          disable_any_whitespace: true
+      extra_args: []
+
+    routing:
+      internal_port: 8000
+      host_port: 8103
+      expose_host: false
+      expose_publicly: false
+
+    litellm:
+      mode: chat
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+
+
+  - id: gemma-4-31b-nvfp4-mtp
+    enabled: false
+    kind: chat
+    backend: vllm
+    image: vllm-node
+    pull_policy: never
+    hf_model: nvidia/Gemma-4-31B-IT-NVFP4
+    served_names:
+      - gemma-4-31B-NVFP4-MTP
+
+    gpu:
+      device_ids: ["0"]
+      memory_fraction: 0.47
+
+    vllm:
+      max_model_len: 262144
+      max_num_seqs: 128
+      max_num_batched_tokens: 8192
+      kv_cache_dtype: fp8
+      quantization: modelopt
+      trust_remote_code: true
+      enable_auto_tool_choice: true
+      enable_prefix_caching: true
+      enable_chunked_prefill: true
+      generation_config: vllm
+      speculative_config:
+        method: mtp
+        model: google/gemma-4-31B-it-assistant
+        num_speculative_tokens: 4
+      tool_call_parser: gemma4
+      reasoning_parser: gemma4
+      extra_args: []
+
+    routing:
+      internal_port: 8000
+      host_port: 8102
+      expose_host: false
+      expose_publicly: false
+
+    litellm:
+      mode: chat
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+      # extra_body:
+      #   chat_template_kwargs:
+      #     enable_thinking: true
+
+  - id: diffusiongemma-26b-nvfp4
+    enabled: false
+    kind: chat
+    backend: vllm
+    image: vllm-node
+    pull_policy: never
+    hf_model: nvidia/diffusiongemma-26B-A4B-it-NVFP4
+    served_names:
+      - diffusiongemma-26b-NVFP4
+
+    gpu:
+      device_ids: ["0"]
+      memory_fraction: 0.45
+
+    vllm:
+      max_model_len: 262144
+      max_num_seqs: 16
+      mm_processor_kwargs:
+        max_soft_tokens: 1120
+      trust_remote_code: true
+      enable_auto_tool_choice: true
+      enable_prefix_caching: true
+      load_format: fastsafetensors
+      attention_backend: TRITON_ATTN
+      diffusion_config:
+        canvas_length: 256
+      override_generation_config:
+        max_new_tokens:
+      tool_call_parser: gemma4
+      reasoning_parser: gemma4
+      default_chat_template_kwargs:
+        enable_thinking: false
+      extra_args: []
+
+    routing:
+      internal_port: 8000
+      host_port: 8102
+      expose_host: false
+      expose_publicly: false
+
+    litellm:
+      mode: chat
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+      # extra_body:
+      #   chat_template_kwargs:
+      #     enable_thinking: true
+
+
+  - id: gemma-4-31b-nvfp4-mtp
+    enabled: false
+    kind: chat
+    backend: vllm
+    image: vllm-node
+    pull_policy: never
+    hf_model: nvidia/Gemma-4-31B-IT-NVFP4
+    served_names:
+      - gemma-4-31B-NVFP4-MTP
+
+    gpu:
+      device_ids: ["0"]
+      memory_fraction: 0.47
+
+    vllm:
+      max_model_len: 262144
+      max_num_seqs: 128
+      max_num_batched_tokens: 8192
+      kv_cache_dtype: fp8
+      quantization: modelopt
+      trust_remote_code: true
+      enable_auto_tool_choice: true
+      enable_prefix_caching: true
+      enable_chunked_prefill: true
+      generation_config: vllm
+      speculative_config:
+        method: mtp
+        model: google/gemma-4-31B-it-assistant
+        num_speculative_tokens: 4
+      tool_call_parser: gemma4
+      reasoning_parser: gemma4
+      extra_args: []
+
+    routing:
+      internal_port: 8000
+      host_port: 8102
+      expose_host: false
+      expose_publicly: false
+
+    litellm:
+      mode: chat
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+      # extra_body:
+      #   chat_template_kwargs:
+      #     enable_thinking: true
+
+
+  - id: qwen3-vl-embedding-8b
+    enabled: false
+    kind: embedding
+    backend: vllm
+    image: vllm-node
+    pull_policy: never
+    hf_model: RamManavalan/Qwen3-VL-Embedding-8B-FP8
+    served_names:
+      - qwen3-vl-embedding-8b
+
+    gpu:
+      device_ids: ["0"]
+      memory_fraction: 0.25
+
+    vllm:
+      runner: pooling
+      max_model_len: 8192
+      max_num_seqs: 16
+      trust_remote_code: true
+      extra_args:
+        - "--limit-mm-per-prompt"
+        - '{"image":1}'
+
+    routing:
+      internal_port: 8000
+      host_port: 8104
+      expose_host: false
+      expose_publicly: false
+
+    litellm:
+      mode: embedding
+      input_cost_per_token: 0
+      # LiteLLM's OpenAI embedding path forwards omitted encoding_format as null;
+      # vLLM accepts omission but rejects null, so set a proxy-side default.
+      params:
+        encoding_format: float
+
+
+  - id: qwen3-6-35b-a3b-nvfp4
+    enabled: false
+    kind: chat
+    backend: vllm
+    image: vllm-node
+    pull_policy: never
+    hf_model: nvidia/Qwen3.6-35B-A3B-NVFP4
+    served_names:
+      - qwen3.6-35b-a3b-NVFP4
+
+    gpu:
+      device_ids: ["0"]
+      memory_fraction: 0.4
+
+    vllm:
+      tensor_parallel_size: 1
+      dtype: auto
+      quantization: modelopt
+      kv_cache_dtype: fp8
+      attention_backend: flashinfer
+      max_model_len: 131072
+      max_num_seqs: 16
+      max_num_batched_tokens: 8192
+      mm_processor_kwargs:
+        size:
+          longest_edge: 16777216
+          shortest_edge: 65536
+      trust_remote_code: true
+      enable_chunked_prefill: true
+      async_scheduling: true
+      enable_prefix_caching: true
+      enable_auto_tool_choice: true
+      speculative_config:
+        method: mtp
+        num_speculative_tokens: 3
+        moe_backend: triton
+      load_format: fastsafetensors
+      reasoning_parser: qwen3
+      tool_call_parser: qwen3_xml
+      default_chat_template_kwargs:
+        enable_thinking: false
+      engine_args:
+        moe_backend: marlin
+      extra_args: []
+
+    routing:
+      internal_port: 8000
+      host_port: 8105
+      expose_host: false
+      expose_publicly: false
+
+    litellm:
+      mode: chat
+      input_cost_per_token: 0
+      output_cost_per_token: 0

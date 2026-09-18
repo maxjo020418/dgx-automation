@@ -1,13 +1,14 @@
-- name: Apply DGX LLM stack
+- name: Apply DGX vLLM/LiteLLM stack
   hosts: dgx
   become: true
   vars_files:
     - ../stack.yml
+    - ../generated/vllm-launch.generated.yml
   vars:
-    stop_legacy: "{{ legacy.stop_on_apply | default(true) }}"
     pull_images: true
     compose_up: true
     release_id: "{{ ansible_date_time.iso8601_basic_short }}"
+    release_retention_keep: "{{ deployment.release_retention.keep | default(5) | int }}"
 
   tasks:
     - name: Ensure deploy directories exist
@@ -18,12 +19,7 @@
       loop:
         - "{{ deploy_dir }}"
         - "{{ deploy_dir }}/releases"
-        - "{{ deploy_dir }}/chat-templates"
-        - "{{ deploy_dir }}/grafana/provisioning/datasources"
-        - "{{ deploy_dir }}/grafana/provisioning/dashboards"
-        - "{{ deploy_dir }}/grafana/dashboards"
-        - "{{ deploy_dir }}/searxng"
-        - "{{ deploy_dir }}/gpu-exporter"
+        - "{{ deploy_dir }}/vllm-launch"
 
     - name: Install initial environment file when missing
       ansible.builtin.copy:
@@ -41,7 +37,7 @@
         from pathlib import Path
 
         env_path = Path("{{ deploy_dir }}/.env")
-        legacy_hf_path = Path("{{ secrets.existing_hf_token_file }}")
+        existing_hf_token_path = Path("{{ secrets.existing_hf_token_file }}")
         env = {}
         order = []
         if env_path.exists():
@@ -68,8 +64,8 @@
             env["GRAFANA_ADMIN_USER"] = "admin"
             order.append("GRAFANA_ADMIN_USER")
 
-        if not env.get("HF_TOKEN") and legacy_hf_path.exists():
-            for line in legacy_hf_path.read_text().splitlines():
+        if not env.get("HF_TOKEN") and existing_hf_token_path.exists():
+            for line in existing_hf_token_path.read_text().splitlines():
                 match = re.match(r"^(?:export\s+)?HF_TOKEN=(.*)$", line.strip())
                 if match:
                     token = match.group(1).strip().strip('"').strip("'")
@@ -95,6 +91,21 @@
       no_log: true
       when: not ansible_check_mode
 
+    - name: Ensure shared Docker network exists
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if docker network inspect "{{ network.name }}" >/dev/null 2>&1; then
+          echo exists
+        else
+          docker network create "{{ network.name }}"
+          echo created
+        fi
+      args:
+        executable: /bin/bash
+      register: shared_network
+      changed_when: "'created' in shared_network.stdout"
+      when: not ansible_check_mode
+
     - name: Create release archive directory
       ansible.builtin.file:
         path: "{{ deploy_dir }}/releases/{{ release_id }}"
@@ -104,7 +115,7 @@
     - name: Archive previous runtime files when present
       ansible.builtin.shell: |
         set -euo pipefail
-        for path in compose.yml litellm.config.yaml prometheus.yml prometheus-vllm-targets.yml traefik-dynamic.yml .env; do
+        for path in compose.yml litellm.config.yaml prometheus-vllm-targets.yml vllm-launch .env; do
           if [ -e "{{ deploy_dir }}/${path}" ]; then
             cp -a "{{ deploy_dir }}/${path}" "{{ deploy_dir }}/releases/{{ release_id }}/${path}"
           fi
@@ -113,6 +124,33 @@
         executable: /bin/bash
       changed_when: false
       when: not ansible_check_mode
+
+    - name: Prune old release archives
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import shutil
+        from pathlib import Path
+
+        keep = max(1, int("{{ release_retention_keep }}"))
+        releases = Path("{{ deploy_dir }}/releases")
+        entries = [path for path in releases.iterdir() if path.name not in (".", "..")]
+        entries.sort(key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
+        stale = entries[keep:]
+        for path in stale:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        print(f"deleted={len(stale)} kept={min(len(entries), keep)}")
+        PY
+      args:
+        executable: /bin/bash
+      register: prune_release_archives
+      changed_when: "'deleted=0' not in prune_release_archives.stdout"
+      when:
+        - release_retention_keep | int > 0
+        - not ansible_check_mode
 
     - name: Copy generated compose
       ansible.builtin.copy:
@@ -125,51 +163,33 @@
         src: ../generated/litellm.config.yaml
         dest: "{{ deploy_dir }}/litellm.config.yaml"
         mode: "0640"
-      notify: Restart LiteLLM
+      register: litellm_config_copy
 
     - name: Copy generated Prometheus vLLM targets
       ansible.builtin.copy:
         src: ../generated/prometheus-vllm-targets.yml
         dest: "{{ deploy_dir }}/prometheus-vllm-targets.yml"
         mode: "0644"
-      notify: Restart monitoring stack
 
-    - name: Copy generated Traefik dynamic config
+    - name: Copy generated vLLM launch scripts
       ansible.builtin.copy:
-        src: ../generated/traefik-dynamic.yml
-        dest: "{{ deploy_dir }}/traefik-dynamic.yml"
-        mode: "0644"
-      notify: Restart Traefik
+        src: ../generated/vllm-launch/
+        dest: "{{ deploy_dir }}/vllm-launch/"
+        mode: "0755"
+      when: vllm_launch_models | default([]) | length > 0
 
-    - name: Copy static runtime files
-      ansible.builtin.copy:
-        src: "{{ item.src }}"
-        dest: "{{ item.dest }}"
-        mode: "{{ item.mode }}"
-      loop:
-        - { src: "../files/prometheus.yml", dest: "{{ deploy_dir }}/prometheus.yml", mode: "0644" }
-        - { src: "../files/grafana/provisioning/datasources/prometheus.yml", dest: "{{ deploy_dir }}/grafana/provisioning/datasources/prometheus.yml", mode: "0644" }
-        - { src: "../files/grafana/provisioning/dashboards/dashboards.yml", dest: "{{ deploy_dir }}/grafana/provisioning/dashboards/dashboards.yml", mode: "0644" }
-        - { src: "../files/grafana/dashboards/spark-system-vllm.json", dest: "{{ deploy_dir }}/grafana/dashboards/spark-system-vllm.json", mode: "0644" }
-        - { src: "../files/searxng/settings.yml", dest: "{{ deploy_dir }}/searxng/settings.yml", mode: "0644" }
-        - { src: "../files/gpu-exporter/Dockerfile", dest: "{{ deploy_dir }}/gpu-exporter/Dockerfile", mode: "0644" }
-        - { src: "../files/gpu-exporter/gpu_exporter.py", dest: "{{ deploy_dir }}/gpu-exporter/gpu_exporter.py", mode: "0755" }
-      notify: Restart config-bound services
-
-    - name: Remove retired Grafana dashboards
+    - name: Remove retired model-stack support files
       ansible.builtin.file:
-        path: "{{ deploy_dir }}/grafana/dashboards/{{ item }}"
+        path: "{{ deploy_dir }}/{{ item }}"
         state: absent
       loop:
-        - dgx-overview.json
-      notify: Restart config-bound services
-
-    - name: Copy chat templates
-      ansible.builtin.copy:
-        src: ../chat-templates/
-        dest: "{{ deploy_dir }}/chat-templates/"
-        mode: "0644"
-      notify: Restart vLLM services
+        - chat-templates
+        - grafana
+        - searxng
+        - gpu-exporter
+        - prometheus.yml
+        - traefik-dynamic.yml
+      when: not ansible_check_mode
 
     - name: Check Docker Compose config
       ansible.builtin.command:
@@ -177,17 +197,6 @@
         chdir: "{{ deploy_dir }}"
       changed_when: false
       when: not ansible_check_mode
-
-    - name: Stop legacy containers
-      ansible.builtin.command:
-        cmd: docker rm -f {{ item }}
-      loop: "{{ legacy.containers }}"
-      register: legacy_stop
-      failed_when: false
-      changed_when: legacy_stop.rc == 0
-      when:
-        - stop_legacy | bool
-        - not ansible_check_mode
 
     - name: Pull remote images
       ansible.builtin.command:
@@ -200,12 +209,216 @@
         - pull_images | bool
         - not ansible_check_mode
 
+    - name: Discover Compose services
+      ansible.builtin.command:
+        cmd: docker compose -p {{ project_name }} -f compose.yml config --services
+        chdir: "{{ deploy_dir }}"
+      register: compose_services
+      changed_when: false
+      when:
+        - compose_up | bool
+        - not ansible_check_mode
+
+    - name: Group Compose services
+      ansible.builtin.set_fact:
+        vllm_compose_services: "{{ compose_services.stdout_lines | select('match', '^vllm-') | list }}"
+        non_vllm_compose_services: "{{ compose_services.stdout_lines | reject('match', '^vllm-') | list }}"
+      when:
+        - compose_up | bool
+        - not ansible_check_mode
+
+    - name: Check NVIDIA persistenced socket
+      ansible.builtin.stat:
+        path: /run/nvidia-persistenced/socket
+      register: nvidia_persistenced_socket
+      when:
+        - compose_up | bool
+        - vllm_launch_models | default([]) | length > 0
+        - not ansible_check_mode
+
+    - name: Check nvidia-persistenced systemd unit
+      ansible.builtin.command:
+        cmd: systemctl list-unit-files nvidia-persistenced.service --no-legend
+      register: nvidia_persistenced_unit
+      changed_when: false
+      failed_when: false
+      when:
+        - compose_up | bool
+        - vllm_launch_models | default([]) | length > 0
+        - not (nvidia_persistenced_socket.stat.exists | default(false))
+        - not ansible_check_mode
+
+    - name: Start nvidia-persistenced for GPU containers
+      ansible.builtin.systemd:
+        name: nvidia-persistenced
+        state: started
+        enabled: true
+      when:
+        - compose_up | bool
+        - vllm_launch_models | default([]) | length > 0
+        - not (nvidia_persistenced_socket.stat.exists | default(false))
+        - (nvidia_persistenced_unit.stdout | default('')) | length > 0
+        - not ansible_check_mode
+
+    - name: Wait for NVIDIA persistenced socket
+      ansible.builtin.wait_for:
+        path: /run/nvidia-persistenced/socket
+        state: present
+        timeout: 10
+      register: nvidia_persistenced_socket_wait
+      failed_when: false
+      when:
+        - compose_up | bool
+        - vllm_launch_models | default([]) | length > 0
+        - not (nvidia_persistenced_socket.stat.exists | default(false))
+        - (nvidia_persistenced_unit.stdout | default('')) | length > 0
+        - not ansible_check_mode
+
+    - name: Recheck NVIDIA persistenced socket
+      ansible.builtin.stat:
+        path: /run/nvidia-persistenced/socket
+      register: nvidia_persistenced_socket_after
+      when:
+        - compose_up | bool
+        - vllm_launch_models | default([]) | length > 0
+        - not ansible_check_mode
+
+    - name: Fail when NVIDIA persistenced socket is missing
+      ansible.builtin.fail:
+        msg: >-
+          NVIDIA Container Toolkit expects /run/nvidia-persistenced/socket for
+          GPU containers, but the socket is missing. Start or reinstall
+          nvidia-persistenced on the host, then rerun make apply. On a systemd
+          host this is usually: sudo systemctl enable --now nvidia-persistenced
+      when:
+        - compose_up | bool
+        - vllm_launch_models | default([]) | length > 0
+        - not (nvidia_persistenced_socket_after.stat.exists | default(false))
+        - not ansible_check_mode
+
+    - name: Apply vLLM models with Spark launcher
+      ansible.builtin.shell: |
+        set -euo pipefail
+        timeout={{ deployment.vllm.startup_timeout_seconds | default(1800) | int }}
+        poll={{ deployment.vllm.startup_poll_seconds | default(5) | int }}
+        settle={{ deployment.vllm.startup_settle_seconds | default(0) | int }}
+        container={{ item.container_name | quote }}
+        launch_script={{ (deploy_dir ~ '/' ~ item.launch_script) | quote }}
+
+        if docker inspect "$container" >/dev/null 2>&1; then
+          docker rm -f "$container" >/dev/null
+        fi
+
+        export HOME={{ deployment.vllm.launcher_home | default('/home/ymin') | quote }}
+        export HF_HOME={{ paths.hf_cache | quote }}
+        export VLLM_SPARK_EXTRA_DOCKER_ARGS={{ item.extra_docker_args | quote }}
+
+        launcher_args=(
+          --solo
+          -d
+          -t {{ item.image | quote }}
+          --name "$container"
+          -p {{ item.port_mapping | quote }}
+        )
+        if [ "{{ deployment.vllm.earlyoom | default(true) | bool }}" = "True" ]; then
+          launcher_args+=(--earlyoom)
+        fi
+        {% for mod in item.apply_mods | default([]) %}
+        launcher_args+=(--apply-mod {{ mod | quote }})
+        {% endfor %}
+        launcher_args+=(--launch-script "$launch_script")
+
+        ./launch-cluster.sh "${launcher_args[@]}"
+
+        cid="$(docker inspect -f '{% raw %}{{.Id}}{% endraw %}' "$container")"
+        deadline=$((SECONDS + timeout))
+        while true; do
+          running="$(docker inspect -f '{% raw %}{{.State.Running}}{% endraw %}' "$cid")"
+          if docker exec "$cid" python3 -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:{{ item.internal_port }}/health", timeout=2).read()' >/dev/null 2>&1; then
+            echo "$container is healthy"
+            break
+          fi
+          if [ "$running" != "true" ]; then
+            echo "$container exited before becoming healthy" >&2
+            docker logs --tail 100 "$cid" >&2 || true
+            exit 1
+          fi
+          if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "$container did not become healthy within ${timeout}s" >&2
+            docker logs --tail 100 "$cid" >&2 || true
+            exit 1
+          fi
+          sleep "$poll"
+        done
+
+        if [ "$settle" -gt 0 ]; then
+          sleep "$settle"
+        fi
+      args:
+        executable: /bin/bash
+        chdir: "{{ deployment.vllm.launcher_dir | default('/home/ymin/spark-vllm-docker') }}"
+      loop: "{{ vllm_launch_models | default([]) }}"
+      loop_control:
+        label: "{{ item.container_name }}"
+      when:
+        - compose_up | bool
+        - vllm_launch_models | default([]) | length > 0
+        - not ansible_check_mode
+
+    - name: Apply LiteLLM service
+      ansible.builtin.command:
+        cmd: docker compose -p {{ project_name }} -f compose.yml up -d --build --remove-orphans {{ non_vllm_compose_services | join(' ') }}
+        chdir: "{{ deploy_dir }}"
+      when:
+        - compose_up | bool
+        - deployment.vllm.staggered_start | default(true) | bool
+        - non_vllm_compose_services | default([]) | length > 0
+        - not ansible_check_mode
+
     - name: Apply Compose stack
       ansible.builtin.command:
         cmd: docker compose -p {{ project_name }} -f compose.yml up -d --build --remove-orphans
         chdir: "{{ deploy_dir }}"
       when:
         - compose_up | bool
+        - not (deployment.vllm.staggered_start | default(true) | bool)
+        - not ansible_check_mode
+
+    - name: Check LiteLLM mounted config
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cid="$(docker compose -p {{ project_name }} -f compose.yml ps -q litellm || true)"
+        if [ -z "$cid" ]; then
+          echo "missing"
+          exit 0
+        fi
+        host_sha="$(sha256sum litellm.config.yaml | awk '{print $1}')"
+        container_sha="$(docker exec "$cid" sha256sum /app/config.yaml 2>/dev/null | awk '{print $1}' || true)"
+        if [ "$host_sha" = "$container_sha" ]; then
+          echo "match"
+          exit 0
+        fi
+        echo "mismatch host=${host_sha} container=${container_sha:-missing}"
+        exit 1
+      args:
+        executable: /bin/bash
+        chdir: "{{ deploy_dir }}"
+      register: litellm_config_mount_check
+      changed_when: false
+      failed_when: false
+      when:
+        - services.litellm.enabled | bool
+        - compose_up | bool
+        - not ansible_check_mode
+
+    - name: Recreate LiteLLM after config drift
+      ansible.builtin.command:
+        cmd: docker compose -p {{ project_name }} -f compose.yml up -d --force-recreate --no-deps litellm
+        chdir: "{{ deploy_dir }}"
+      when:
+        - services.litellm.enabled | bool
+        - compose_up | bool
+        - (litellm_config_copy.changed | default(false)) or ((litellm_config_mount_check.rc | default(0)) != 0)
         - not ansible_check_mode
 
     - name: Wait for LiteLLM HTTP surface
@@ -218,53 +431,7 @@
       delay: 5
       until: litellm_health.status in [200, 401, 403]
       when:
+        - services.litellm.enabled | bool
         - services.litellm.expose_host | bool
-        - compose_up | bool
-        - not ansible_check_mode
-
-  handlers:
-    - name: Restart LiteLLM
-      ansible.builtin.command:
-        cmd: docker compose -p {{ project_name }} -f compose.yml restart litellm
-        chdir: "{{ deploy_dir }}"
-      when:
-        - compose_up | bool
-        - not ansible_check_mode
-
-    - name: Restart Traefik
-      ansible.builtin.command:
-        cmd: docker compose -p {{ project_name }} -f compose.yml restart traefik
-        chdir: "{{ deploy_dir }}"
-      when:
-        - compose_up | bool
-        - not ansible_check_mode
-
-    - name: Restart monitoring stack
-      ansible.builtin.command:
-        cmd: docker compose -p {{ project_name }} -f compose.yml restart prometheus grafana
-        chdir: "{{ deploy_dir }}"
-      when:
-        - compose_up | bool
-        - not ansible_check_mode
-
-    - name: Restart config-bound services
-      ansible.builtin.command:
-        cmd: docker compose -p {{ project_name }} -f compose.yml restart prometheus grafana searxng gpu-exporter
-        chdir: "{{ deploy_dir }}"
-      when:
-        - compose_up | bool
-        - not ansible_check_mode
-
-    - name: Restart vLLM services
-      ansible.builtin.shell: |
-        set -euo pipefail
-        services="$(docker compose -p {{ project_name }} -f compose.yml config --services | grep '^vllm-' | tr '\n' ' ')"
-        if [ -n "$services" ]; then
-          docker compose -p {{ project_name }} -f compose.yml restart $services
-        fi
-      args:
-        executable: /bin/bash
-        chdir: "{{ deploy_dir }}"
-      when:
         - compose_up | bool
         - not ansible_check_mode

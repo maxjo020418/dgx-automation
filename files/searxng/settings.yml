@@ -1,4 +1,18 @@
-use_default_settings: true
+use_default_settings:
+  engines:
+    remove:
+      - qwant
+      - qwant news
+      - qwant images
+      - qwant videos
+      - duckduckgo
+      - duckduckgo images
+      - duckduckgo videos
+      - duckduckgo news
+      - duckduckgo weather
+      - startpage
+      - startpage news
+      - startpage images
 
 server:
   bind_address: "0.0.0.0"
@@ -7,9 +21,12 @@ server:
   limiter: false
   image_proxy: true
 
-redis:
-  url: redis://searxng-valkey:6379/0
+valkey:
+  url: valkey://searxng-valkey:6379/0
 
 search:
   safe_search: 1
   autocomplete: ""
+  formats:
+    - html
+    - json

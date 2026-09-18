@@ -24,20 +24,27 @@ generated/*
 /opt/dgx-llm-stack/* on the server, except emergency debugging
 ```
 
-`make apply` renders local config, copies it to `/opt/dgx-llm-stack` on
-`ymin@spark.cg-rookies.net`, archives the previous release, and runs Docker
-Compose detached.
+`make apply` renders local config, copies only the vLLM/LiteLLM runtime to
+`/opt/dgx-llm-stack` on the inventory target, archives the previous release,
+starts vLLM through `/home/ymin/spark-vllm-docker/launch-cluster.sh`, and runs
+the LiteLLM Compose service detached.
+
+Support services are split into `/opt/dgx-services` and are intended to be
+managed directly on the DGX host after migration. `make migrate-services` is a
+seed/bootstrap helper: it creates missing files from `files/dgx-services/*`, but
+does not overwrite existing `/opt/dgx-services/compose.yml`,
+`/opt/dgx-services/traefik-dynamic.yml`, or service config files.
 
 ## Current Endpoints
 
-These names resolve through the DGX dnsmasq split-DNS setup:
+Public routing uses the base hostname plus paths:
 
 ```text
-spark.cg-rookies.net          -> OpenWebUI
-chat.spark.cg-rookies.net     -> OpenWebUI
-api.spark.cg-rookies.net      -> LiteLLM
-grafana.spark.cg-rookies.net  -> Grafana
-search.spark.cg-rookies.net   -> SearXNG
+pika.ihopper.co.kr/                    -> OpenWebUI
+pika.ihopper.co.kr/llm/v1              -> LiteLLM OpenAI-compatible API
+pika.ihopper.co.kr/grafana/            -> Grafana
+pika.ihopper.co.kr/searxng/            -> SearXNG
+pika.ihopper.co.kr/traefik/dashboard/  -> Traefik dashboard
 ```
 
 LiteLLM is currently configured with no API key requirement:
@@ -56,10 +63,13 @@ Docker and is not exposed on the host.
 ```bash
 make bootstrap              # install local Ansible/Jinja/PyYAML into .venv
 make validate               # validate stack.yml and models.yml
-make render                 # regenerate generated/*
+make render                 # regenerate model-stack files in generated/*
+make services-compose-config # validate /opt/dgx-services/compose.yml on the host
+make migrate-services       # seed missing /opt/dgx-services files and start that stack
 make stage                  # copy files and run remote compose config only
-make apply                  # deploy; stops legacy containers if configured
-make apply STOP_LEGACY=0    # deploy without trying to stop legacy containers
+make apply                  # deploy only vLLM + LiteLLM
+make apply PULL_IMAGES=0    # deploy without checking/pulling registry images
+make migrate-services SERVICES_PULL_IMAGES=0
 make smoke                  # endpoint and chat-completion checks
 make ufw-apply              # ensure WireGuard-scoped UFW rules
 make rollback RELEASE=...   # restore a release from /opt/dgx-llm-stack/releases
@@ -77,33 +87,39 @@ deploy_dir: /opt/dgx-llm-stack
 ```
 
 `project_name` is the Docker Compose project name. `deploy_dir` is where Ansible
-copies rendered files on the DGX host.
+copies the vLLM/LiteLLM files on the DGX host. The support-service compose
+project is `dgx-services` and lives at `/opt/dgx-services`.
 
 ### Domain
 
 ```yaml
 domain:
-  base: spark.cg-rookies.net
-  openwebui: chat.spark.cg-rookies.net
-  litellm: api.spark.cg-rookies.net
-  grafana: grafana.spark.cg-rookies.net
-  searxng: search.spark.cg-rookies.net
+  base: pika.ihopper.co.kr
+  openwebui: chat.pika.ihopper.co.kr
+  litellm: api.pika.ihopper.co.kr
+  grafana: grafana.pika.ihopper.co.kr
+  searxng: search.pika.ihopper.co.kr
+  traefik: traefik.pika.ihopper.co.kr
 ```
 
-These values become Traefik `Host(...)` rules. dnsmasq currently maps
-`*.spark.cg-rookies.net` to `192.168.111.1`.
+The public Traefik routers currently use `domain.base` with path prefixes.
+dnsmasq only needs to map `pika.ihopper.co.kr` to `10.90.0.103` unless
+subdomain routers are restored later.
 
 ### Network
 
 ```yaml
 network:
   name: dgx-llm-net
-  bind_ip: 192.168.111.1
+  bind_ip: 10.90.0.103
 ```
 
 `bind_ip` is the WireGuard-side address used for published service ports. Do not
 set this to `0.0.0.0` unless you intentionally want services exposed beyond the
 VPN boundary.
+
+Both compose projects join the external Docker network named by `network.name`.
+The playbooks create it when missing.
 
 ### Global GPU Policy
 
@@ -111,6 +127,7 @@ VPN boundary.
 gpu:
   default_headroom: 0.08
   max_fraction_per_gpu: 0.92
+  validate_memory_fraction_budget: false
   allowed_device_ids: ["0"]
 ```
 
@@ -123,6 +140,29 @@ uses GPU `0`.
 `default_headroom` is used by `scripts/rebalance.py` for weighted rebalance. It
 is not directly added by the validator; the validator uses `max_fraction_per_gpu`
 as the limit.
+
+### Deployment
+
+```yaml
+deployment:
+  vllm:
+    launcher_dir: /home/ymin/spark-vllm-docker
+    launcher_home: /home/ymin
+    earlyoom: true
+    staggered_start: true
+    startup_timeout_seconds: 1800
+    startup_poll_seconds: 5
+    startup_settle_seconds: 10
+```
+
+`make apply` starts one `vllm-*` container at a time with
+`launch-cluster.sh --solo --earlyoom -d`, waits for
+`http://127.0.0.1:8000/health` from inside the container, then starts the next
+one. The probe uses the model's configured `routing.internal_port`.
+
+This healthcheck is the readiness signal that makes staggering meaningful. A
+plain container start only means the process exists; it does not mean vLLM has
+finished loading the model and sizing GPU memory.
 
 ### Services
 
@@ -143,18 +183,32 @@ services:
 When `expose_host: true`, Compose publishes the service on:
 
 ```text
-192.168.111.1:<host_port>
+10.90.0.103:<host_port>
 ```
 
 Prometheus/exporters/raw vLLM should remain internal. User-facing access should
 go through Traefik or the WireGuard-bound host ports.
+
+Traefik routes are file-based after migration. Edit this file on the DGX host to
+change or add reverse proxy entries:
+
+```text
+/opt/dgx-services/traefik-dynamic.yml
+```
+
+Prometheus is managed by the services stack, but it mounts the Ansible-generated
+vLLM target file from:
+
+```text
+/opt/dgx-llm-stack/prometheus-vllm-targets.yml
+```
 
 ## `models.yml`
 
 `models.yml` is the model fleet. Each enabled entry renders:
 
 ```text
-one vLLM container
+one vLLM launch script
 one or more LiteLLM model aliases
 one Prometheus scrape target
 ```
@@ -178,17 +232,19 @@ models:
       memory_fraction: 0.71
 
     vllm:
+      recipe: recipes/gemma4-26b-a4b-nvfp4.yaml
       max_model_len: 262144
       max_num_seqs: 32
       max_num_batched_tokens: 32768
+      tensor_parallel_size: 1
+      load_format: instanttensor
       kv_cache_dtype: fp8
-      quantization: modelopt
       trust_remote_code: true
-      chat_template: chat-templates/tool_chat_template_gemma4.jinja
       extra_args: []
 
     routing:
       internal_port: 8000
+      host_port: 8101
       expose_host: false
       expose_publicly: false
 
@@ -218,29 +274,104 @@ pull_policy: never
 ```
 
 `vllm-node` is the local DGX Spark vLLM image built from
-`/home/ymin/spark-vllm-docker`. `pull_policy: never` prevents Compose from trying
-to pull it from a registry.
+`/home/ymin/spark-vllm-docker`. vLLM containers are launched from that repo with
+the generated launch script. `pull_policy` is retained as model metadata, but
+vLLM is no longer pulled or started by Compose.
 
 ### vLLM Arguments
 
-Fields under `vllm:` render into the `vllm serve ...` command. Common fields:
+Fields under `vllm:` render into the generated `vllm serve ...` launch script.
+`recipe` records the Spark recipe this model is aligned with; the active Gemma
+deployment refers to `recipes/gemma4-26b-a4b-nvfp4.yaml`. Common generation
+fields:
 
 ```yaml
 max_model_len: 262144
 max_num_seqs: 32
 max_num_batched_tokens: 32768
+tensor_parallel_size: 1
+pipeline_parallel_size: 1
 kv_cache_dtype: fp8
-quantization: modelopt
+load_format: instanttensor
 trust_remote_code: true
 enable_auto_tool_choice: true
 enable_prefix_caching: true
+enable_chunked_prefill: true
+async_scheduling: true
+generation_config: vllm
+speculative_config:
+  method: mtp
+  model: google/gemma-4-26B-A4B-it-assistant
+  num_speculative_tokens: 4
+  moe_backend: triton
 tool_call_parser: gemma4
 reasoning_parser: gemma4
-chat_template: chat-templates/tool_chat_template_gemma4.jinja
+mm_processor_kwargs:
+  max_soft_tokens: 1120
+engine_args:
+  structured_outputs_config:
+    backend: xgrammar
+    disable_any_whitespace: true
 extra_args: []
 ```
 
-Use `extra_args` only for flags the renderer does not expose yet.
+Use `engine_args` for vLLM CLI flags that are not first-class fields in this
+repo yet. Keys may use underscores or dashes and render as long-form CLI flags:
+
+```yaml
+engine_args:
+  structured_outputs_config:
+    backend: xgrammar
+    disable_any_whitespace: true
+  logits_processor_pattern: ".*"
+  limit_mm_per_prompt:
+    image: 1
+```
+
+This renders as:
+
+```text
+--structured-outputs-config '{"backend":"xgrammar","disable_any_whitespace":true}'
+--logits-processor-pattern .*
+--limit-mm-per-prompt '{"image":1}'
+```
+
+Boolean `true` renders a flag with no value. Boolean `false` and `null` are
+omitted. Mappings and lists are rendered as compact JSON. Use `extra_args` only
+when you need exact raw CLI tokens.
+
+For vLLM builds that expose the older/newer guided-decoding flag directly, the
+same field can pass it as a boolean flag:
+
+```yaml
+engine_args:
+  guided_decoding_disable_any_whitespace: true
+```
+
+For embedding models, prefer the current vLLM pooling runner fields when your
+image supports them:
+
+```yaml
+vllm:
+  runner: pooling
+  convert: embed
+  pooler_config:
+    pooling_type: MEAN
+```
+
+Older vLLM images may still require the deprecated task selector instead:
+
+```yaml
+vllm:
+  task: embed
+```
+
+Per-model environment variables are passed to that model's launcher container:
+
+```yaml
+env:
+  VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+```
 
 Example:
 
@@ -261,6 +392,10 @@ routing:
 ```
 
 Keep raw vLLM `expose_host: false` unless you have a temporary debugging reason.
+`host_port` is still required: when `expose_host: false`, Ansible passes a
+loopback-only `127.0.0.1:<host_port>:<internal_port>` mapping to
+`launch-cluster.sh` so the container can join `network.name` instead of using
+Docker host networking.
 LiteLLM should be the model API boundary.
 
 ### LiteLLM Options
@@ -268,6 +403,8 @@ LiteLLM should be the model API boundary.
 ```yaml
 litellm:
   mode: chat
+  params:
+    input_type: query
   input_cost_per_token: 0
   output_cost_per_token: 0
   extra_body:
@@ -286,6 +423,47 @@ shape is:
 }
 ```
 
+`params` is rendered directly under LiteLLM `litellm_params`. This is useful for
+embedding-specific provider options such as `input_type`.
+
+Embedding model example:
+
+```yaml
+models:
+  - id: bge-m3
+    enabled: false
+    kind: embedding
+    backend: vllm
+    image: vllm-node
+    pull_policy: never
+    hf_model: BAAI/bge-m3
+    served_names:
+      - bge-m3
+
+    gpu:
+      device_ids: ["0"]
+      memory_fraction: 0.08
+
+    vllm:
+      runner: pooling
+      convert: embed
+      max_model_len: 8192
+      trust_remote_code: true
+
+    routing:
+      internal_port: 8000
+      host_port: 8106
+      expose_host: false
+      expose_publicly: false
+
+    litellm:
+      mode: embedding
+      input_cost_per_token: 0
+```
+
+Clients still use OpenAI-compatible APIs through LiteLLM. Embeddings go to
+`/v1/embeddings` with `model` set to one of the configured `served_names`.
+
 ## Memory Allocation
 
 ### What `memory_fraction` Means
@@ -298,7 +476,7 @@ gpu:
   memory_fraction: 0.71
 ```
 
-`memory_fraction` renders to:
+`memory_fraction` renders into the generated vLLM launch script as:
 
 ```bash
 --gpu-memory-utilization 0.71
@@ -320,7 +498,13 @@ Current global cap:
 
 ```yaml
 max_fraction_per_gpu: 0.92
+validate_memory_fraction_budget: false
 ```
+
+Set `validate_memory_fraction_budget: true` to make `make validate` reject
+over-budget totals. Set it to `false` to keep the per-model sanity checks but
+allow experiments where the summed fractions exceed `max_fraction_per_gpu`.
+This does not change vLLM runtime behavior; it only controls validation.
 
 Current model:
 
@@ -451,6 +635,7 @@ Rebalance updates `models.yml`; it does not deploy by itself.
 ```yaml
 routing:
   internal_port: 8000
+  host_port: 8101
   expose_host: false
   expose_publicly: false
 ```
@@ -478,7 +663,9 @@ Then:
 make apply
 ```
 
-Compose runs with `--remove-orphans`, so removed generated services disappear.
+`make apply` removes and recreates the named vLLM launcher container for enabled
+models. The LiteLLM Compose apply still runs with `--remove-orphans`; it does
+not touch `/opt/dgx-services`.
 
 ## Rollback
 
@@ -486,6 +673,15 @@ Each apply archives the previous runtime files under:
 
 ```text
 /opt/dgx-llm-stack/releases/
+```
+
+Release archives are pruned automatically after each apply. The retention count
+is controlled by:
+
+```yaml
+deployment:
+  release_retention:
+    keep: 5
 ```
 
 Rollback:

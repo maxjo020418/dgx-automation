@@ -7,6 +7,9 @@ model_list:
       model: openai/{{ served_name }}
       api_base: http://{{ model.container_name }}:{{ model.routing.internal_port }}/v1
       api_key: dummy
+{% if model.litellm.params is defined and model.litellm.params %}
+{{ model.litellm.params | yaml(6) }}
+{% endif %}
 {% if model.litellm.extra_body is defined %}
       extra_body:
 {{ model.litellm.extra_body | yaml(8) }}
